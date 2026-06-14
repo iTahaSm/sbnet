@@ -564,7 +564,7 @@ func parseBridgeURI(uri string) (common.BridgeConfig, error) {
 	return cfg, nil
 }
 
-func dialBridge(bridgeCfg common.BridgeConfig) (net.Conn, error) {
+func dialBridge(bridgeCfg common.BridgeConfig) (net.Conn, [32]byte, error) {
 	var conn net.Conn
 	var err error
 
@@ -581,19 +581,22 @@ func dialBridge(bridgeCfg common.BridgeConfig) (net.Conn, error) {
 		conn, err = net.DialTimeout("tcp", bridgeCfg.Endpoint, 15*time.Second)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("dial bridge %s: %w", bridgeCfg.Endpoint, err)
+		return nil, [32]byte{}, fmt.Errorf("dial bridge %s: %w", bridgeCfg.Endpoint, err)
 	}
 	if err := common.ObfsHandshake(conn); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("obfs handshake with bridge: %w", err)
+		return nil, [32]byte{}, fmt.Errorf("obfs handshake with bridge: %w", err)
 	}
 
-	_, clientEphPub := common.GenKeyPair()
+	// The handshake carries our hop-1 ephemeral pubkey; the bridge forwards it
+	// to the foreign entry as the Create, so we keep priv0 to derive Keys[0]
+	// from the entry's Created. (No second Create is sent.)
+	priv0, clientEphPub := common.GenKeyPair()
 	token := []byte(bridgeCfg.Token)
 	bodyLen := 2 + len(token) + 32
 	if bodyLen > common.CellBodyMax {
 		conn.Close()
-		return nil, fmt.Errorf("bridge token too long")
+		return nil, [32]byte{}, fmt.Errorf("bridge token too long")
 	}
 
 	var handshake common.Cell
@@ -604,23 +607,24 @@ func dialBridge(bridgeCfg common.BridgeConfig) (net.Conn, error) {
 	copy(handshake.Body[2:], token)
 	copy(handshake.Body[2+len(token):], clientEphPub[:])
 	conn.Write(common.MarshalCell(handshake))
-	return conn, nil
+	return conn, priv0, nil
 }
 
-func buildCircuitViaBridge(bridgeCfg common.BridgeConfig) (*Circuit, error) {
-	conn, err := dialBridge(bridgeCfg)
+// buildCircuitViaBridge builds a full 3-hop circuit whose entry hop is reached
+// through the bridge gateway. After the bridge completes hop 1 with a foreign
+// entry relay, the bridge is a transparent cell pipe, so the circuit is
+// extended to middle and exit exactly as in the direct path.
+func buildCircuitViaBridge(bridgeCfg common.BridgeConfig, middle, exitR *common.RelayDescriptor) (*Circuit, error) {
+	conn, priv0, err := dialBridge(bridgeCfg)
 	if err != nil {
 		return nil, err
 	}
 
-	circID := uint32(0xFFFFFFFF)
-	circ := &Circuit{CircID: circID, Conn: conn, built: time.Now()}
+	circ := &Circuit{CircID: 0xFFFFFFFF, Conn: conn, built: time.Now()}
 
-	priv0, pub0 := common.GenKeyPair()
-	create := common.Cell{CircID: circID, Command: common.CmdCreate, Length: 32}
-	copy(create.Body[:], pub0[:])
-	conn.Write(common.MarshalCell(create))
-
+	// ── Hop 1: foreign entry (via bridge) ──
+	// The bridge already forwarded our handshake pubkey as the Create; read the
+	// foreign entry's Created and derive the hop-1 key.
 	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	created, err := common.ReadCell(conn)
 	conn.SetReadDeadline(time.Time{})
@@ -631,6 +635,17 @@ func buildCircuitViaBridge(bridgeCfg common.BridgeConfig) (*Circuit, error) {
 	var rPub0 [32]byte
 	copy(rPub0[:], created.Body[:32])
 	circ.Keys[0] = common.DeriveKey(priv0, rPub0)
+
+	// ── Hop 2: middle ──
+	if err := extendCircuit(circ, middle, 1); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("bridge extend middle %s: %w", middle.ID, err)
+	}
+	// ── Hop 3: exit ──
+	if err := extendCircuit(circ, exitR, 2); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("bridge extend exit %s: %w", exitR.ID, err)
+	}
 	return circ, nil
 }
 
@@ -913,10 +928,25 @@ func main() {
 				logger.Error("Invalid bridge URI: %v", err)
 				return
 			}
-			logger.Info("Bridge mode: %s (obfs=%s)", bridgeCfg.Endpoint, bridgeCfg.Obfs)
+			// Bridge mode still builds a full 3-hop circuit through the foreign
+			// network; dir_url must point to the foreign directory so we can
+			// select middle/exit relays to extend to after the bridge hop.
+			logger.Info("Bridge mode: %s (obfs=%s); foreign consensus from %s",
+				bridgeCfg.Endpoint, bridgeCfg.Obfs, cfg.DirURL)
+			consensus, err := fetchConsensus(cfg.DirURL, cfg.DirTLSCA)
+			if err != nil {
+				logger.Error("Bridge mode: cannot get foreign consensus: %v", err)
+				return
+			}
 			var circuits []*Circuit
 			for i := 0; i < cfg.CircuitCount; i++ {
-				c, err := buildCircuitViaBridge(bridgeCfg)
+				middle := pickRelay(consensus.Relays, "middle")
+				exitR := pickRelay(consensus.Relays, "exit")
+				if middle == nil || exitR == nil {
+					logger.Error("Bridge mode: foreign consensus lacks middle/exit relays")
+					break
+				}
+				c, err := buildCircuitViaBridge(bridgeCfg, middle, exitR)
 				if err != nil {
 					logger.Warn("Bridge circuit %d/%d failed: %v", i+1, cfg.CircuitCount, err)
 					continue

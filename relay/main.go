@@ -280,10 +280,9 @@ func (s *relayServer) handleCell(c common.Cell, conn net.Conn) {
 }
 
 // forwardCells pipes cells from OutConn back toward the client (InConn).
-// CmdRelay cells are re-encrypted with this relay's key so the client
-// can peel the expected onion layer.
-// CmdRelayDone (0xFE) passes through unmodified — it is the end-of-response
-// sentinel that the exit relay sends after finishing a request.
+// CmdRelay and CmdRelayDone cells are re-encrypted with this relay's key so the
+// client can peel exactly one onion layer per hop; other control cells pass
+// through unmodified.
 func (s *relayServer) forwardCells(circ *Circuit) {
 	for {
 		c, err := common.ReadCell(circ.OutConn)
